@@ -102,9 +102,12 @@ class StockInfo:
 
 class Inventory:
 
-    def __init__(self, env):
+    def __init__(self, env, wtp):
         self.stock = defaultdict(StockInfo)
         self.env = env
+        # {product: scipy gaussian_kde} of willingness to pay. Held once here rather than
+        # passed on every sell_stock call, so it cannot drift from the curves Demand uses.
+        self.wtp = wtp
 
     def stockup(self, order):
         """Receive an order. ``order``: {product: {'quantity': int, 'shelf_life': int, ...}}."""
@@ -138,16 +141,37 @@ class Inventory:
         return [product, quantity, price]
 
     def sell_stock(self, order):
-        """Consume demand from stock, oldest lot first.
+        """Consume price-adjusted demand from stock, oldest lot first.
 
-        ``order``: {product: units_demanded}. Returns parallel lists of (product, units
-        actually sold). Unmet demand is ``demanded - sold`` and is not recorded here.
+        ``order``: {product: units} — *potential* demand, before customers react to price.
+        Prices come from ``set_price`` and the WTP curves from ``self.wtp``.
+
+        Returns parallel lists of (product, units actually sold). Unmet demand is
+        ``realised demand - sold`` and is not recorded here.
         """
         product = []
         sold = []
 
         for product_select in order:
-            demand = order[product_select]
+            product_price = self.stock[product_select].price
+
+            # A product that has never been priced cannot be sold. Without this guard the
+            # KDE integral returns NaN and round(NaN) raises ValueError — reachable as soon
+            # as a supplier 'stockup' event delivers something set_price has not covered.
+            if np.isnan(product_price):
+                product.append(product_select)
+                sold.append(0)
+                continue
+
+            # Walk the WTP demand curve to turn potential demand into realised demand.
+            # integrate_box_1d(-inf, p) is the CDF at p — the share of demand that would
+            # only buy below p — so 1 - that is the share still willing to transact at p.
+            # Raising the price shrinks demand_percent; this is what makes pricing bite.
+            demand_percent = 1 - self.wtp[product_select].integrate_box_1d(-np.inf, product_price)
+
+            # Round to whole units; sub-unit demand disappears rather than accumulating.
+            demand = round(order[product_select] * demand_percent)
+
             sku = self.stock[product_select].sku
             product_sold = 0
 
@@ -177,21 +201,33 @@ class Inventory:
 class SupplierInfo:
     """One supplier's terms for one product.
 
-    ``price`` and ``lead_time`` are frozen scipy distributions (e.g. ``norm(loc=3, scale=1)``),
-    not scalars — each purchase draws from them, so quoted cost and delivery date vary.
+    ``lead_time`` is a frozen scipy distribution (e.g. ``norm(loc=3, scale=1)``), not a
+    scalar — each purchase draws from it, so the delivery date varies.
 
     ``order_quantity`` is the discrete set of lot sizes this supplier will sell, e.g.
     ``[1000, 5000, 10000]``. Purchases must pick one of them; ``order_purchase`` rejects
     anything else.
+
+    ``price`` is a *volume price break*: one frozen distribution per lot size, in the same
+    order as ``order_quantity``, so bigger lots can carry a lower unit cost. The two must
+    be the same length.
     """
 
     def __init__(self, name, product, price, lead_time, order_quantity):
+        # Parallel sequences are easy to get out of step, so refuse a mismatch up front
+        # rather than letting it surface as a wrong unit price much later.
+        if len(price) != len(order_quantity):
+            raise ValueError(
+                f'{name}/{product}: {len(price)} price tiers for '
+                f'{len(order_quantity)} lot sizes — they must correspond one to one'
+            )
+
         self.name = name
         self.product = product      # single product code, e.g. 'FOODS_1'
-        self.price = price          # frozen distribution over unit cost
         self.lead_time = lead_time  # frozen distribution over delivery delay in days
-        # Stored as a tuple so a caller cannot mutate the supplier's terms through the
-        # list they passed in, and so Quote stays hashable.
+        # Stored as tuples so a caller cannot mutate the supplier's terms through the
+        # lists they passed in, and so Quote stays hashable.
+        self.price = tuple(price)                   # unit-cost distribution per lot size
         self.order_quantity = tuple(order_quantity)
 
 
@@ -201,14 +237,23 @@ class Quote(NamedTuple):
     A named tuple rather than parallel lists: fields stay attached to each other, so
     callers cannot misalign them by index. Still unpacks like a tuple if wanted.
 
-    ``price`` is per unit; multiply by the chosen ``order_quantity`` entry for order value.
+    ``price`` holds one drawn unit price per lot size, aligned with ``order_quantity``.
+    Use ``price_for(quantity)`` rather than indexing the two by hand.
     """
 
     supplier: SupplierInfo
     product: str
-    price: float
+    price: tuple
     lead_time: float
     order_quantity: tuple
+
+    def price_for(self, quantity):
+        """Quoted unit price for one of the offered lot sizes."""
+        return self.price[self.order_quantity.index(quantity)]
+
+    def cost_for(self, quantity):
+        """Total quoted cost of ordering that lot size."""
+        return self.price_for(quantity) * quantity
 
 
 class Supplier:
@@ -246,7 +291,8 @@ class Supplier:
                 quotes.append(Quote(
                     supplier=select,
                     product=code,
-                    price=round(select.price.rvs(), 2),
+                    # One draw per price break, so each lot size gets its own unit price.
+                    price=tuple(round(tier.rvs(), 2) for tier in select.price),
                     lead_time=select.lead_time.kwds['loc'],
                     order_quantity=select.order_quantity,   # lot sizes on offer
                 ))
@@ -257,8 +303,9 @@ class Supplier:
         """Place orders and schedule their arrival.
 
         ``supplier``: {SupplierInfo: {'quantity': int, 'price': float}} — the accepted
-        subset of a proposal, keyed by the supplier object itself. Build it from quotes
-        with e.g. ``{q.supplier: {'quantity': q.order_quantity[0], 'price': q.price}}``.
+        subset of a proposal, keyed by the supplier object itself. ``price`` is the unit
+        price for the chosen lot size, so build it from the quote's price break:
+        ``{q.supplier: {'quantity': n, 'price': q.price_for(n)}}``.
 
         ``quantity`` must be one of the lot sizes that supplier offers; anything else is a
         ValueError rather than a silently impossible order.
