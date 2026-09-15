@@ -76,10 +76,17 @@ class Env:
 
     def __init__(self):
         self.clock = 0
-        # Min-heap of pending events ordered by the day they fire:
-        # (day, event_type, *payload). Supplier.order_purchase pushes 'stockup' here.
-        # No heapify needed — an empty list is already a valid heap.
-        self.event_calendar = []
+        # Pending events keyed by the day they fire: {day: payload}. Supplier.order_purchase
+        # books 'stockup' deliveries here via add_event; the policy loop drains them with
+        # remove_event(self.clock) once the clock reaches that day.
+        self.event_calendar = defaultdict(list)
+
+    def add_event(self, time, event):
+        self.event_calendar[time].append(event)
+
+    def remove_event(self, time):
+        res = self.event_calendar.pop(time, None)
+        return res
 
     def clock_step(self, stepup=1):
         self.clock += stepup
@@ -121,6 +128,11 @@ class Inventory:
             # on partial consumption.
             heapq.heappush(self.stock[product].sku, [expiry, quantity])
 
+            # Book the write-off on the day this lot goes bad; the policy loop pops it and
+            # calls flushout_expired(product). No quantity in the payload — sell_stock will
+            # have eaten into the lot by then, so the handler reads what is left off the heap.
+            self.env.add_event(expiry, ('expire', product))
+
     def set_price(self, order):
         """Set the current sell price per department. ``order``: {product: {'price': float, ...}}."""
         for product in order:
@@ -139,6 +151,42 @@ class Inventory:
             price.append(info.price)
 
         return [product, quantity, price]
+
+    def flushout_expired(self, product=None):
+        """Write off every lot that has reached its expiry day.
+
+        ``product``: one department, matching the payload of an 'expire' calendar event, or
+        None to sweep the whole inventory. Returns parallel lists of (product, units lost).
+
+        Cheap because sku is expiry-ordered: the loop stops at the first lot still in date,
+        so only genuinely expired lots are ever touched.
+
+        Reads the surviving quantity off the heap rather than trusting anything recorded when
+        the lot arrived — sell_stock will have eaten into it in the meantime. That also makes
+        the call idempotent, so a duplicate or late 'expire' event simply writes off nothing.
+        """
+        if product is None:
+            selected = list(self.stock)
+        else:
+            # Not self.stock[product]: it is a defaultdict, and indexing a product that was
+            # never stocked would insert an empty entry as a side effect of the lookup.
+            selected = [product] if product in self.stock else []
+
+        flushed = []
+        wasted = []
+
+        for product_select in selected:
+            sku = self.stock[product_select].sku
+            product_wasted = 0
+
+            # <= clock, not <: a lot expiring today is already unsellable today.
+            while sku and sku[0][0] <= self.env.clock:
+                product_wasted += heapq.heappop(sku)[1]
+
+            flushed.append(product_select)
+            wasted.append(product_wasted)
+
+        return [flushed, wasted]
 
     def sell_stock(self, order):
         """Consume price-adjusted demand from stock, oldest lot first.
@@ -299,7 +347,7 @@ class Supplier:
 
         return quotes
 
-    def order_purchase(self, env, supplier):
+    def order_purchase(self, env, supplier, demand_index):
         """Place orders and schedule their arrival.
 
         ``supplier``: {SupplierInfo: {'quantity': int, 'price': float}} — the accepted
@@ -321,14 +369,18 @@ class Supplier:
                     f'offers {list(select.order_quantity)}'
                 )
 
-            # Actual delivery delay is drawn here, independent of the lead time quoted above.
-            lead_time = round(select.lead_time.rvs())
-            heapq.heappush(env.event_calendar,
-                           (env.clock+lead_time,
-                            'stockup',
-                            select.product,
-                            quantity,
-                            terms['price']))
+            # Actual delivery delay is drawn here, independent of the lead time quoted above,
+            # then stretched by how busy the market is. Floored at 1 so a negative draw or a
+            # collapsed market cannot schedule an arrival on or before today.
+            lead_time = max(1, round(select.lead_time.rvs() * (1 + demand_index)))
+
+            # The arrival day is the calendar key, so the payload carries only the delivery
+            # itself. add_event appends, so several orders can land on the same day.
+            env.add_event(env.clock + lead_time,
+                          ('stockup',
+                           select.product,
+                           quantity,
+                           terms['price']))
     
 
     
