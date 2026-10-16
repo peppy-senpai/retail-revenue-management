@@ -51,13 +51,17 @@ class Demand:
         self.pca = PCA(n_components=self.n_component)
         self.X_reduced = self.pca.fit_transform(x_scaled).round(0)
 
-    def generate_demand(self, seed=42, damp=0.8):
+    def generate_demand(self, seed=None, damp=0.8):
         """Draw one synthetic demand path, shaped like ``X_reduced``'s source matrix.
 
         Jitters each department's PCA scores by noise scaled to each component's own
         standard deviation, so dominant components move more than minor ones and the
         perturbation stays consistent with the data's covariance structure. ``damp``
         shrinks that noise; 1.0 would add as much variance again as the component carries.
+
+        ``seed`` is an int or a ``np.random.Generator`` — pass ``env.demand_rng`` so each
+        epoch draws a new path from the simulation's seed. A fixed int returns the same
+        path on every call.
         """
         rng = np.random.default_rng(seed)
         noise = rng.normal(0, damp * np.sqrt(self.pca.explained_variance_), size=self.X_reduced.shape)
@@ -72,9 +76,32 @@ class Demand:
 
 
 class Env:
-    """Simulation clock. Every component reads ``clock`` for the current day index."""
+    """Simulation clock. Every component reads ``clock`` for the current day index.
 
-    def __init__(self):
+    ``seed`` is the single source of randomness for a run. It is split into independent
+    streams, one per source of uncertainty, so changing how often one is drawn (e.g. a
+    policy that requests more quotes) does not shift the others — every policy sees the
+    same demand paths for the same seed:
+
+    * ``demand_rng``   - synthetic demand paths (``Demand.generate_demand``)
+    * ``supplier_rng`` - quoted prices and realised lead times (``Supplier``)
+    * ``forecast_rng`` - forecast errors
+
+    ``seed=None`` draws fresh entropy, so runs are not reproducible.
+    """
+
+    def __init__(self, seed=None):
+        self._seed_streams(seed)
+        self._reset_state()
+
+    def _seed_streams(self, seed):
+        self.seed = seed
+        demand_ss, supplier_ss, forecast_ss = np.random.SeedSequence(seed).spawn(3)
+        self.demand_rng = np.random.default_rng(demand_ss)
+        self.supplier_rng = np.random.default_rng(supplier_ss)
+        self.forecast_rng = np.random.default_rng(forecast_ss)
+
+    def _reset_state(self):
         self.clock = 0
         # Pending events keyed by the day they fire: {day: payload}. Supplier.order_purchase
         # books 'stockup' deliveries here via add_event; the policy loop drains them with
@@ -91,8 +118,17 @@ class Env:
     def clock_step(self, stepup=1):
         self.clock += stepup
 
-    def reset(self):
-        self.__init__()
+    def reset(self, seed=None):
+        """Clear the clock and calendar for a new epoch.
+
+        With ``seed``, the random streams are re-seeded from it, so this epoch can be
+        reproduced on its own by resetting with the same seed. Without it, the streams
+        carry on rather than restarting: each epoch gets new draws while the run as a
+        whole stays reproducible from the seed given to ``Env``.
+        """
+        if seed is not None:
+            self._seed_streams(seed)
+        self._reset_state()
 
 
 class StockInfo:
@@ -115,6 +151,23 @@ class Inventory:
         # {product: scipy gaussian_kde} of willingness to pay. Held once here rather than
         # passed on every sell_stock call, so it cannot drift from the curves Demand uses.
         self.wtp = wtp
+
+    def reset(self, keep_price=False):
+        """Drop every lot, ready for a fresh epoch. Pairs with Env.reset.
+
+        Without this, stock and pending expiry events carry over between epochs and each run
+        starts from whatever the previous one left behind.
+
+        ``env`` and ``wtp`` survive — they are configuration, not state. Prices are state, so
+        they reset to NaN by default and the epoch must call set_price again; pass
+        ``keep_price=True`` to hold pricing fixed and re-initialise only the stock.
+        """
+        prices = {p: info.price for p, info in self.stock.items()} if keep_price else {}
+
+        self.stock = defaultdict(StockInfo)
+
+        for product, price in prices.items():
+            self.stock[product].price = price
 
     def stockup(self, order):
         """Receive an order. ``order``: {product: {'quantity': int, 'shelf_life': int, ...}}."""
@@ -139,18 +192,17 @@ class Inventory:
             self.stock[product].price = order[product]['price']
 
     def inventory_status(self):
-        """Return parallel lists of (product, total units on hand, current price)."""
-        product = []
-        quantity = []
-        price = []
+        """Return {product: {'quantity': total units on hand, 'price': current price}}."""
+        status = {}
 
         for product_select, info in self.stock.items():
             # Total on hand is the sum across every lot, regardless of expiry.
-            product.append(product_select)
-            quantity.append(sum(lot[1] for lot in info.sku))
-            price.append(info.price)
+            status[product_select] = {
+                'quantity': sum(lot[1] for lot in info.sku),
+                'price': info.price,
+            }
 
-        return [product, quantity, price]
+        return status
 
     def flushout_expired(self, product=None):
         """Write off every lot that has reached its expiry day.
@@ -194,11 +246,10 @@ class Inventory:
         ``order``: {product: units} — *potential* demand, before customers react to price.
         Prices come from ``set_price`` and the WTP curves from ``self.wtp``.
 
-        Returns parallel lists of (product, units actually sold). Unmet demand is
+        Returns {product: units actually sold}. Unmet demand is
         ``realised demand - sold`` and is not recorded here.
         """
-        product = []
-        sold = []
+        sold = {}
 
         for product_select in order:
             product_price = self.stock[product_select].price
@@ -207,8 +258,7 @@ class Inventory:
             # KDE integral returns NaN and round(NaN) raises ValueError — reachable as soon
             # as a supplier 'stockup' event delivers something set_price has not covered.
             if np.isnan(product_price):
-                product.append(product_select)
-                sold.append(0)
+                sold[product_select] = 0
                 continue
 
             # Walk the WTP demand curve to turn potential demand into realised demand.
@@ -240,10 +290,9 @@ class Inventory:
                     product_sold += in_stock
                     demand -= in_stock
 
-            product.append(product_select)
-            sold.append(product_sold)
+            sold[product_select] = product_sold
 
-        return [product, sold]
+        return sold
 
 
 class SupplierInfo:
@@ -319,7 +368,7 @@ class Supplier:
             self.supplier.append(info)
             self.by_product[info.product].append(info)
 
-    def order_proposal(self, product):
+    def order_proposal(self, product, rng=None):
         """Quote every supplier that carries any of the products in ``product``.
 
         Returns a list of Quote. Cost is O(len(product) + matches) via the index, rather
@@ -327,6 +376,8 @@ class Supplier:
 
         Note the two quoted figures are produced differently: price is a fresh random draw,
         while lead time reads the distribution's ``loc`` parameter directly.
+
+        ``rng`` drives the price draws — pass ``env.supplier_rng`` for reproducible quotes.
         """
         if isinstance(product, str):    # a single code, not a collection of them
             product = [product]
@@ -340,7 +391,7 @@ class Supplier:
                     supplier=select,
                     product=code,
                     # One draw per price break, so each lot size gets its own unit price.
-                    price=tuple(round(tier.rvs(), 2) for tier in select.price),
+                    price=tuple(round(tier.rvs(random_state=rng), 2) for tier in select.price),
                     lead_time=select.lead_time.kwds['loc'],
                     order_quantity=select.order_quantity,   # lot sizes on offer
                 ))
@@ -350,37 +401,77 @@ class Supplier:
     def order_purchase(self, env, supplier, demand_index):
         """Place orders and schedule their arrival.
 
-        ``supplier``: {SupplierInfo: {'quantity': int, 'price': float}} — the accepted
-        subset of a proposal, keyed by the supplier object itself. ``price`` is the unit
-        price for the chosen lot size, so build it from the quote's price break:
-        ``{q.supplier: {'quantity': n, 'price': q.price_for(n)}}``.
+        ``supplier``: {SupplierInfo: terms} — the accepted subset of a proposal, keyed by
+        the supplier object itself. ``terms`` takes one of two forms:
 
-        ``quantity`` must be one of the lot sizes that supplier offers; anything else is a
-        ValueError rather than a silently impossible order.
+        * ``{'quantity': n, 'price': p}`` — a single lot. ``n`` must be one of the lot sizes
+          that supplier offers, and ``p`` its unit price: ``q.price_for(n)``.
+        * ``{'lots': [n0, n1, ...], 'price': [p0, p1, ...]}`` — any mix of lot sizes at once.
+          ``lots[t]`` is how many lots of ``order_quantity[t]`` to buy and ``price[t]`` that
+          tier's unit price, both aligned with ``order_quantity``, so a quote's own
+          ``q.price`` fits directly: ``{q.supplier: {'lots': lots, 'price': q.price}}``.
 
-        Each order becomes a future 'stockup' event on the shared calendar rather than
+        Anything that does not match the supplier's lot sizes is a ValueError rather than a
+        silently impossible order.
+
+        Each order becomes one future 'stockup' event on the shared calendar rather than
         landing in inventory now; the policy loop pops it once the clock reaches that day.
+        A multi-lot order arrives as a single delivery at its unit-weighted average price.
+        The event payload is ``('stockup', product, quantity, price, supplier_name,
+        ordered_on)``.
+
+        Returns a list of the orders placed, one dict per supplier with ``supplier``,
+        ``product``, ``quantity``, ``unit_price``, ``cost`` (quantity x unit price) and
+        ``ordered_on`` — enough to track stock on order and spend.
         """
+        placed = []
         for select, terms in supplier.items():
-            quantity = terms['quantity']
-            if quantity not in select.order_quantity:
-                raise ValueError(
-                    f'{select.name} does not sell {select.product} in lots of {quantity}; '
-                    f'offers {list(select.order_quantity)}'
-                )
+            if 'lots' in terms:
+                lots, prices = list(terms['lots']), list(terms['price'])
+                if len(lots) != len(select.order_quantity) or len(prices) != len(lots):
+                    raise ValueError(
+                        f'{select.name}: lots and price need one entry per lot size '
+                        f'{list(select.order_quantity)}; got lots={lots}, price={prices}'
+                    )
+                if any(n < 0 for n in lots):
+                    raise ValueError(f'{select.name}: negative lot count in {lots}')
+
+                quantity = sum(n * size for n, size in zip(lots, select.order_quantity))
+                if quantity == 0:
+                    continue    # nothing ordered from this supplier
+
+                price = sum(n * size * p for n, size, p
+                            in zip(lots, select.order_quantity, prices)) / quantity
+            else:
+                quantity, price = terms['quantity'], terms['price']
+                if quantity not in select.order_quantity:
+                    raise ValueError(
+                        f'{select.name} does not sell {select.product} in lots of {quantity}; '
+                        f'offers {list(select.order_quantity)}'
+                    )
 
             # Actual delivery delay is drawn here, independent of the lead time quoted above,
             # then stretched by how busy the market is. Floored at 1 so a negative draw or a
             # collapsed market cannot schedule an arrival on or before today.
-            lead_time = max(1, round(select.lead_time.rvs() * (1 + demand_index)))
+            lead_time = max(1, round(select.lead_time.rvs(random_state=env.supplier_rng)
+                                     * (1 + demand_index)))
 
-            # The arrival day is the calendar key, so the payload carries only the delivery
-            # itself. add_event appends, so several orders can land on the same day.
+            # The arrival day is the calendar key, so the payload carries the delivery plus
+            # who shipped it and when it was ordered — the policy measures the realised lead
+            # time on arrival rather than peeking at it here. add_event appends, so several
+            # orders can land on the same day.
             env.add_event(env.clock + lead_time,
                           ('stockup',
                            select.product,
                            quantity,
-                           terms['price']))
+                           price,
+                           select.name,
+                           env.clock))
+            placed.append({'supplier': select.name, 'product': select.product,
+                           'quantity': quantity, 'unit_price': price,
+                           'cost': quantity * price, 'ordered_on': env.clock})
+
+        return placed
     
 
     
