@@ -151,6 +151,7 @@ class Inventory:
         # {product: scipy gaussian_kde} of willingness to pay. Held once here rather than
         # passed on every sell_stock call, so it cannot drift from the curves Demand uses.
         self.wtp = wtp
+        self._share_cache = {}   # (product, price) -> share of demand that buys; see _buy_share
 
     def reset(self, keep_price=False):
         """Drop every lot, ready for a fresh epoch. Pairs with Env.reset.
@@ -240,6 +241,20 @@ class Inventory:
 
         return [flushed, wasted]
 
+    def _buy_share(self, product, price):
+        """1 - WTP CDF at ``price``, memoised per (product, price).
+
+        Prices change only on restock or a scheduled switch, while sell_stock runs daily, so
+        the KDE integral is computed once per price rather than every day. The WTP curves are
+        fixed for the inventory's lifetime, so the cache never goes stale.
+        """
+        key = (product, price)
+        share = self._share_cache.get(key)
+        if share is None:
+            share = 1 - self.wtp[product].integrate_box_1d(-np.inf, price)
+            self._share_cache[key] = share
+        return share
+
     def sell_stock(self, order):
         """Consume price-adjusted demand from stock, oldest lot first.
 
@@ -265,7 +280,7 @@ class Inventory:
             # integrate_box_1d(-inf, p) is the CDF at p — the share of demand that would
             # only buy below p — so 1 - that is the share still willing to transact at p.
             # Raising the price shrinks demand_percent; this is what makes pricing bite.
-            demand_percent = 1 - self.wtp[product_select].integrate_box_1d(-np.inf, product_price)
+            demand_percent = self._buy_share(product_select, product_price)
 
             # Round to whole units; sub-unit demand disappears rather than accumulating.
             demand = round(order[product_select] * demand_percent)
