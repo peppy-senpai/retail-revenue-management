@@ -51,17 +51,11 @@ class ActorNetwork(nn.Module):
 
         self.checkpoint_file = chkpt_dir / "actor_torch_ppo"
 
-        layers = []
-        for i, dim in enumerate(fc_dims):
-            if i==0:
-                layers.append(nn.Linear(*input_dims, dim))
-                layers.append(nn.Tanh())
-            elif i==len(fc_dims)-1:
-                layers.append(nn.Linear(dim, n_actions))
-            else:
-                layers.append(nn.Linear(prev_dim, dim))
-                layers.append(nn.Tanh())
-            prev_dim = dim
+        layers, prev = [], input_dims
+        for dim in fc_dims:
+            layers += [nn.Linear(prev, dim), nn.Tanh()]
+            prev = dim
+        layers.append(nn.Linear(prev, n_actions))
 
         self.actor_mean = nn.Sequential(*layers)
         self.actor_log_std = nn.Parameter(T.zeros(n_actions)-0.5)
@@ -71,7 +65,7 @@ class ActorNetwork(nn.Module):
 
     def forward(self, state):
         mu = self.actor_mean(state)
-        std = self.action_log_std.exp().expand_as(mu)
+        std = self.actor_log_std.exp().expand_as(mu)
         dist = Normal(mu, std)
 
         return dist
@@ -89,17 +83,11 @@ class CriticNetwork(nn.Module):
 
         self.checkpoint_file = chkpt_dir / "critic_torch_ppo"
 
-        layers = []
-        for i, dim in enumerate(fc_dims):
-            if i==0:
-                layers.append(nn.Linear(*input_dims, dim))
-                layers.append(nn.Tanh())
-            elif i==len(fc_dims)-1:
-                layers.append(nn.Linear(dim, 1))
-            else:
-                layers.append(nn.Linear(prev_dim, dim))
-                layers.append(nn.Tanh())
-            prev_dim = dim
+        layers, prev = [], input_dims
+        for dim in fc_dims:
+            layers += [nn.Linear(prev, dim), nn.Tanh()]
+            prev = dim
+        layers.append(nn.Linear(prev, 1))
 
         self.critic = nn.Sequential(*layers)
         self.optimizer = optim.Adam(self.parameters(), lr=alpha)
@@ -164,30 +152,33 @@ class Agent:
 
         return clipped_action, prob, value
 
-    def learn(self):
+    def compute_gae(self, rewards, values, dones, last_value):
+        adv, gae = np.zeros(len(rewards), dtype=np.float32), 0.0
+        for t in reversed(range(len(rewards))):
+            next_v = last_value if t == len(rewards) - 1 else values[t + 1]
+            nonterm = 1.0 - dones[t]
+            delta = rewards[t] + self.gamma * next_v * nonterm - values[t]
+            gae = delta + self.gamma * self.gae_lambda * nonterm * gae    # resets at an episode end
+            adv[t] = gae
+        return adv
+
+    def learn(self, last_value):
+        
+        state_arr, action_arr, old_prob_arr, vals_arr, \
+        reward_arr, dones_arr, _ = self.memory.generate_batches()
+
+        advantage = self.compute_gae(reward_arr, vals_arr, dones_arr.astype(np.float32), last_value)
+
+        advantage = T.tensor(advantage, dtype=T.float).to(self.actor.device)
+        values = T.tensor(vals_arr, dtype=T.float).to(self.actor.device)
+
         for _ in range(self.n_epochs):
-            state_arr, action_arr, old_prob_arr, vals_arr, \
-            reward_arr, dones_arr, batches = self.memory.generate_batches()
-
-            values = vals_arr
-            advantage = np.zeros(len(reward_arr), dtype=np.float32)
-
-            for t in range(len(reward_arr)-1):
-                discount = 1
-                a_t = 0
-                for k in range(t, len(reward_arr)-1):
-                    a_t += discount * (reward_arr[k] + self.gamma*values[k+1]*(1-int(dones_arr[k]))
-                                       - values[k])
-                    discount *= self.gamma * self.gae_lambda
-                advantage[t] = a_t
-
-            advantage = T.tensor(advantage).to(self.actor.device)
-            values = T.tensor(values).to(self.actor.device)
+            _, _, _, _, _, _, batches = self.memory.generate_batches()   # fresh shuffle each epoch
 
             for batch in batches:
                 states = T.tensor(state_arr[batch],
                                   dtype=T.float).to(self.actor.device)
-                old_probs = T.tensor(old_prob_arr[batch]).to(self.actor.device)
+                old_probs = T.tensor(old_prob_arr[batch], dtype=T.float).to(self.actor.device)
                 actions = T.tensor(action_arr[batch],
                                    dtype=T.float).to(self.actor.device)
                 dist = self.actor(states)
