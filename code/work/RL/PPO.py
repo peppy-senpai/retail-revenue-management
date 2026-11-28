@@ -71,6 +71,7 @@ class ActorNetwork(nn.Module):
         return dist
 
     def save_checkpoint(self):
+        Path(self.checkpoint_file).parent.mkdir(parents=True, exist_ok=True)   # create the folder if missing
         T.save(self.state_dict(), self.checkpoint_file)
 
     def load_checkpoint(self):
@@ -100,6 +101,7 @@ class CriticNetwork(nn.Module):
         return value
 
     def save_checkpoint(self):
+        Path(self.checkpoint_file).parent.mkdir(parents=True, exist_ok=True)   # create the folder if missing
         T.save(self.state_dict(), self.checkpoint_file)
 
     def load_checkpoint(self):
@@ -110,15 +112,19 @@ class Agent:
     def __init__(self, n_actions, input_dims, action_low, action_high,
                  gamma=0.99, alpha=0.0003, gae_lambda=0.95,
                  policy_clip=0.2, batch_size=64, n_epochs=10,
-                 entropy_coef=0.01):
+                 entropy_coef=0.01, actor_dims=(256, 256), critic_dims=(256, 256),
+                 save_dir=Path.cwd()):
+        """actor_dims / critic_dims: hidden layer sizes, one entry per layer,
+        e.g. (64, 64) -> input -> 64 -> 64 -> output."""
         self.gamma = gamma
         self.policy_clip = policy_clip
         self.n_epochs = n_epochs
         self.gae_lambda = gae_lambda
         self.entropy_coef = entropy_coef
+        self.save_dirs = save_dir
 
-        self.actor = ActorNetwork(n_actions, input_dims, alpha, fc_dims=[256,256])
-        self.critic = CriticNetwork(input_dims, alpha, fc_dims=[256,256])
+        self.actor = ActorNetwork(n_actions, input_dims, alpha, fc_dims=list(actor_dims), chkpt_dir=self.save_dirs)
+        self.critic = CriticNetwork(input_dims, alpha, fc_dims=list(critic_dims), chkpt_dir=self.save_dirs)
         self.memory = PPOMemory(batch_size)
 
         self.action_low = T.tensor(action_low, dtype=T.float).to(self.actor.device)
@@ -138,19 +144,30 @@ class Agent:
         self.critic.load_checkpoint()
 
     def choose_actions(self, observations):
+        """Sample an action for one observation.
+
+        Returns (clipped_action, raw_action, log_prob, value):
+          clipped_action  clamped to [action_low, action_high] -> send this to the environment
+          raw_action      the unclipped sample, shape (n_actions,) -> store this with remember();
+                          log_prob belongs to this sample, so storing the clipped one would
+                          make PPO's probability ratio wrong whenever clipping happens
+        """
         state = T.tensor(observations, dtype=T.float).unsqueeze(0).to(self.actor.device)
 
-        dist = self.actor(state)
-        value = self.critic(state)
-        action = dist.sample()
+        with T.no_grad():
+            dist = self.actor(state)
+            value = self.critic(state)
+            action = dist.sample()                                   # (1, n_actions)
 
-        prob = T.squeeze(dist.log_prob(action).sum(axis=-1)).item()
-        value = T.squeeze(value).item()
+            prob = dist.log_prob(action).sum(axis=-1).item()
+            value = value.item()
+            clipped = T.clamp(action, self.action_low, self.action_high)
 
-        clipped_action = T.clamp(action, self.action_low, self.action_high)
-        clipped_action = T.squeeze(clipped_action).detach().cpu().numpy()
+        # squeeze only the batch dimension, so the action keeps shape (n_actions,)
+        raw_action = action.squeeze(0).cpu().numpy()
+        clipped_action = clipped.squeeze(0).cpu().numpy()
 
-        return clipped_action, prob, value
+        return clipped_action, raw_action, prob, value
 
     def compute_gae(self, rewards, values, dones, last_value):
         adv, gae = np.zeros(len(rewards), dtype=np.float32), 0.0
@@ -181,8 +198,9 @@ class Agent:
                 old_probs = T.tensor(old_prob_arr[batch], dtype=T.float).to(self.actor.device)
                 actions = T.tensor(action_arr[batch],
                                    dtype=T.float).to(self.actor.device)
+                actions = actions.reshape(len(batch), -1)       # (batch, n_actions), matches dist
                 dist = self.actor(states)
-                critic_value = T.squeeze(self.critic(states))
+                critic_value = self.critic(states).squeeze(-1)  # (batch,), also for a batch of 1
 
                 new_probs = dist.log_prob(actions).sum(axis=-1)
                 prob_ratio = (new_probs - old_probs).exp()
